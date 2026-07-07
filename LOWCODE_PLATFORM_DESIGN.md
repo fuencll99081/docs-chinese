@@ -529,3 +529,186 @@ createPageEditingSession()
    - "Headless 编辑核心如何解耦 UI 与逻辑？AI Agent 是如何调用这些 API 的？"
    - "多级缓存出页的缓存失效策略是什么？发布后如何保证用户立即看到新版本？"
    - "组件依赖系统在删除/复制/粘贴时如何保证一致性？"
+
+---
+
+## 十三、协同编辑功能实现
+
+### 13.1 整体架构
+
+协同编辑基于快手内部的 **`@koko/core`** 库（v1.0.18），采用 **Block 级别的 OT（Operational Transformation）** 同步引擎，通过 **KLink**（快手内部实时网络协议）传输。不使用 Yjs/Automerge/ShareDB。
+
+系统有两种编辑模式：
+- **协同模式**：多人实时 OT 同步
+- **单人模式**：基于 Redis `PAGE_LOCK:` 的独占编辑锁（旧机制，协同启用时被绕过）
+
+### 13.2 KoKo Block 数据模型
+
+每个页面有三个维度的共享 Block，命名规则：
+
+| Block 类型 | ID 格式 | 用途 |
+|---|---|---|
+| Page Block | `jimu-{env}-{activityId}-page` | 跟踪页面上有哪些元素 EID |
+| Element Block | `jimu-{env}-{activityId}-element-{eid}` | 单个元素的 schema 同步 |
+| Awareness Block | `jimu-{env}-{activityId}-awareness` | 用户在线状态、选区、聚焦配置项 |
+
+对应封装类在 `packages/client/editor/src/libs/multiplayer/` 下：`MultiplayerPage`、`MultiplayerElement`、`MultiplayerAwareness`。
+
+### 13.3 核心类与数据结构
+
+#### MultiplayerConnecter（connecter.ts）
+
+连接管理，从 `/api/multiplayer/koko-info` 获取 KoKo 配置（appName/appKey），初始化网络连接，监听 `runningModeChange` 事件。
+
+#### MultiplayerBlock\<T\>（block.ts）
+
+KoKo `Block` 的泛型封装，提供 `get`/`setAsync`/`deleteAsync` 操作。数组类型使用 `listAdd`/`listRemove` 实现增量同步而非整体覆盖。
+
+#### MultiplayerPage（page.ts）
+
+管理页面级 Block，跟踪哪些 EID 存在于页面上。提供 `addPageElement`/`deletePageElement`/`updateSaveInfo`（防抖 300ms）/`updateEditInfo` 等方法。
+
+#### MultiplayerElement（elements.ts）
+
+管理单个元素 Schema 的同步。`initWithLocal` 从本地创建，`initWithRemote` 从 KoKo 加载，`setSchemaValue` 同步属性变更，`onElementChange` 监听远端变更。
+
+#### MultiplayerAwareness（awareness.ts）
+
+管理用户感知数据：
+
+```typescript
+interface IUserPresence {
+    uid: string;
+    username: string;
+    avatar: string;
+    heartbeat: number;       // 心跳时间戳
+    status: 'online' | 'offline';
+    selection: Eid[];        // 当前选中的元素
+    focusedProps?: { eid, prop }[];  // 当前聚焦的配置项
+}
+```
+
+心跳 60 秒超时判定为离线。
+
+#### MultiplayerMode 枚举（store/multiplayer.ts）
+
+```typescript
+enum MultiplayerMode {
+    READ_AND_WRITE = 'read_and_write',
+    READONLY = 'readonly',
+    LEAVE = 'leave',
+    PENDING = 'pending',     // 网络暂时断开
+    PAUSE = 'pause',         // 业务暂停（如版本管理器打开）
+}
+```
+
+### 13.4 实时同步流程
+
+#### 本地变更 → 远程同步
+
+```
+用户编辑元素 → useSchemaDiffer (watch deep) → diffElements() → diffObjects()
+→ handleElementDiff() → MultiplayerElement.setSchemaValue(path, value)
+→ block.setAsync() → KoKo Transaction → KLink → 服务端 OT
+```
+
+KoKo 支持的操作类型（`CommandType`）：`set`、`update`、`listAdd`、`listRemove`、`remove`、`recover`、`removeKey` 等。数组操作用 `listAdd`/`listRemove` 实现增量同步，避免整体覆盖。
+
+#### 远程变更 → 本地更新
+
+KoKo Block 的 `onChange` 事件触发回调：
+- **Page 级**：比较远端 EID 集合 vs 本地 EID 集合 → 新增/删除元素
+- **Element 级**：`diffObjects()` 比较远端 schema vs 本地 schema → 有差异时 `restoreFromSchema()` 恢复到画布
+
+### 13.5 加入流程
+
+```typescript
+async function join(mode, forcePush) {
+    // 1. 创建 connector 连接 KoKo
+    connecter.value = new MultiplayerConnecter(activityId);
+    await connecter.value.connect();
+
+    // 2. 初始化 awareness（用户感知）
+    awareness.value = new MultiplayerAwareness(activityId, uid);
+    await awareness.value.init();
+
+    // 3. 初始化 page block
+    page.value = new MultiplayerPage(activityId);
+    await page.value.init();
+
+    // 4. 判断推送本地还是拉取远端
+    const eids = page.value.getRemoteElementEids();
+    if (canWrite && (forcePush || eids.length === 0 || canUseLocalPage())) {
+        await applyCurrentPage2Multiplayer();  // 推送本地到 KoKo
+    } else {
+        await multiplayerPage2CurrentPage();   // 拉取远端到本地
+    }
+
+    // 5. 注册元素增删监听
+    page.value.onElementAdded(handleElementAdded);
+    page.value.onElementDeleted(handleElementDeleted);
+}
+```
+
+### 13.6 冲突处理
+
+**无显式冲突解决 UI**，设计理念：
+- 不同用户编辑不同元素 → 永不冲突
+- 同一元素不同属性 → 服务端 OT 逐属性路径做 last-writer-wins
+- 同一属性 → OT 按操作顺序解决
+
+**软冲突规避**：配置面板编辑时，通过 awareness 的 `focusedProps` 检测他人是否正在编辑同一配置项，弹窗提示"X正在操作当前配置项，强制编辑可能会覆盖TA的配置"（`checkAndConfirmOtherFocusedProps()`）。
+
+### 13.7 用户感知（Presence）
+
+- 心跳 60 秒超时判定离线，20 秒更新一次心跳
+- 顶栏显示自己 + 其他协作者头像（`user-box.vue`、`users-popover.vue`）
+- 图层面板显示各元素的协作者头像（`layer-node-users.vue`）
+- 状态栏显示"X在Y月Z日保存/编辑了页面"（`page-status-box.vue`）
+- 多人协作时显示"多人协作中，您的操作会影响其他用户"提示
+
+### 13.8 网络容错
+
+状态机：`online → pending（断网）→ reconnect → online`
+
+重连时比较本地编辑时间 vs 远端编辑时间（`canUseLocalPage()`），决定推送本地还是拉取远端。页面隐藏时自动停止心跳，页面恢复时重新连接。
+
+### 13.9 多标签页防冲突
+
+`EditorRadio` 基于 `BroadcastChannel('jimu_editor')` 检测同一活动在多标签页打开，限制最多 3 个并发编辑窗口。
+
+### 13.10 特性开关
+
+- 服务端：`useEditorMultiplayer` biz config 按环境/活动控制
+- 客户端：`localStorage` 的 `jimu_multiplayer_off_ids` 可关闭指定活动；URL 参数 `offline-edit=1` 强制单人模式
+- 回滚标记：Redis `ACTIVITY_ROLLBACK_FLAG:` 标记页面被回滚，下次加入时强制推送本地数据
+
+### 13.11 关键文件索引
+
+```
+packages/client/editor/src/
+├── libs/multiplayer/              # KoKo 封装层
+│   ├── connecter.ts               # 连接管理
+│   ├── koko-app.ts                # KoKo App 实例工厂
+│   ├── block.ts                   # Block 泛型封装
+│   ├── page.ts                    # Page Block
+│   ├── elements.ts                # Element Block
+│   ├── awareness.ts               # 用户感知
+│   └── stay-length.ts             # 协作时长遥测
+├── store/multiplayer.ts           # 中心 Pinia Store (1516行)
+├── composition/schema-differ.ts   # Schema diff 计算
+├── utils/object-diff.ts           # 深度对象 diff
+├── utils/element-diff.ts          # 元素级 diff 类型
+├── libs/conflict.ts              # 多标签冲突检测
+├── libs/editor-radio.ts          # BroadcastChannel 协议
+├── libs/functions/multiplayer.ts # awareness 查询辅助
+└── components/multiplayer/        # 协同 UI 组件
+    ├── users-popover.vue          # 协作者列表
+    └── layer-node-users.vue       # 元素协作者头像
+
+packages/client/shared/definitions/src/editor/multiplayer.ts  # 核心类型定义
+
+packages/server/jimu-server/
+├── app/controller/api/platform/multiplayer.ts  # KoKo 配置接口
+└── app/router/api/index.ts                     # 路由注册
+```
